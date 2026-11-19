@@ -1,0 +1,74 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    paths: ['configs/**', 'patches/**', '.github/**']
+
+jobs:
+  kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      KVER: 7.3.5
+      SERIES: v7.x
+      ARCH: arm64
+      CROSS: aarch64-linux-gnu-
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends gcc-aarch64-linux-gnu bc bison flex \
+            libssl-dev libelf-dev device-tree-compiler xz-utils gzip tar
+
+      - name: kernel source
+        run: |
+          curl -fsSL -o linux-$KVER.tar.xz https://cdn.kernel.org/pub/linux/kernel/$SERIES/linux-$KVER.tar.xz
+          curl -fsSL -o sums.asc https://cdn.kernel.org/pub/linux/kernel/$SERIES/sha256sums.asc
+          grep "linux-$KVER.tar.xz" sums.asc | sha256sum -c -
+          tar xf linux-$KVER.tar.xz
+          cd linux-$KVER
+          for p in ../patches/linux/*.patch; do echo "apply $(basename $p)"; patch -p1 -s -i "$p"; done
+
+      - name: config
+        run: |
+          cd linux-$KVER
+          cp ../configs/nura-sm8350.config .config
+          scripts/kconfig/merge_config.sh -m -O . .config ../configs/b2q.fragment ../configs/openwrt.fragment > /dev/null
+          make ARCH=$ARCH CROSS_COMPILE=$CROSS olddefconfig
+          for s in NFT_TPROXY NFT_REDIR NFT_SOCKET NETFILTER_XT_TARGET_TPROXY NETFILTER_XT_MATCH_SOCKET \
+                   USB_CONFIGFS USB_CONFIGFS_ECM USB_CONFIGFS_RNDIS ATH11K_PCI QCOM_Q6V5_PAS; do
+            grep -qE "^CONFIG_$s=[ym]" .config || { echo "missing CONFIG_$s"; exit 1; }
+          done
+          cp .config ../config-$KVER
+
+      - name: build
+        run: |
+          cd linux-$KVER
+          make -j$(nproc) ARCH=$ARCH CROSS_COMPILE=$CROSS Image dtbs modules
+
+      - name: package
+        run: |
+          cd linux-$KVER
+          mkdir -p ../pkg
+          gzip -9 -n -c arch/arm64/boot/Image > ../pkg/Image.gz
+          cp arch/arm64/boot/dts/qcom/sm8350-samsung-b2q.dtb ../pkg/
+          make -s ARCH=$ARCH CROSS_COMPILE=$CROSS INSTALL_MOD_PATH=$PWD/../pkg modules_install
+          cd ../pkg
+          rm -f lib/modules/*/build lib/modules/*/source
+          tar czf modules-$(make -s -C ../linux-$KVER ARCH=$ARCH CROSS_COMPILE=$CROSS kernelrelease).tar.gz lib/modules
+          rm -rf lib
+          sha256sum Image.gz sm8350-samsung-b2q.dtb modules-*.tar.gz > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: b2q-kernel
+          path: |
+            pkg/Image.gz
+            pkg/sm8350-samsung-b2q.dtb
+            pkg/modules-*.tar.gz
+            pkg/SHA256SUMS
+            config-7.3.5
+          retention-days: 30

@@ -1,0 +1,485 @@
+From: Noa Himesaka <himesaka@noa.codes>
+Subject: [PATCH] power: supply: max77705: charge from the wireless input
+
+The charger has a second input, WCIN, for a wireless charging receiver.
+The driver selected CHGIN only, so a pad's power never reached the
+battery. Do what stock's charger does: select both inputs (CNFG_12
+0x60) and, while WCIN is valid and no cable is attached, CHGIN alone
+off (0x40), so a cable takes over from the pad. The WCIN limit starts at
+480 mA and goes up 100 mA a second to the limit the receiver reports
+(stock's wc_current_work); it drops to 425 mA when the pad goes away.
+
+The receiver is found through the new maxim,wireless-charger reference
+each time the limit is worked out, and put right after (holding it kept
+its power supply alive past its driver, and unloading the receiver
+module then froze the phone); a power supply notifier follows its
+changes, and the charger never waits for the receiver's driver at
+probe. Without it,
+WCIN runs at maxim,wireless-input-current-microamp (stock's initial
+500 mA). ONLINE, the input health and the input current limit now follow the
+input in use.
+
+AICL on a pad steps the WCIN limit down instead of CHGIN_LIM, and holds
+the ramp there; the CHGIN loop no longer steps below 100 mA, where the
+field wrapped to its maximum. While OTG is on, WCIN is left alone
+(stock toggles WCINSEL around that mode change, which is not done
+here).
+
+Signed-off-by: Noa Himesaka <himesaka@noa.codes>
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../bindings/power/supply/maxim,max77705.yaml      |   14 +
+ drivers/power/supply/max77705_charger.c            |  274 +++++++++++++++++++-
+ include/linux/power/max77705_charger.h             |   14 +
+ 3 files changed, 295 insertions(+), 7 deletions(-)
+
+
+diff --git a/Documentation/devicetree/bindings/power/supply/maxim,max77705.yaml b/Documentation/devicetree/bindings/power/supply/maxim,max77705.yaml
+index 55dacf7..c180f66 100644
+--- a/Documentation/devicetree/bindings/power/supply/maxim,max77705.yaml
++++ b/Documentation/devicetree/bindings/power/supply/maxim,max77705.yaml
+@@ -102,6 +102,20 @@ properties:
+       Data of the USB-C block's SET_SNKCAP command, the sink capabilities
+       offered to sources.
+ 
++  maxim,wireless-charger:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description:
++      Wireless charging receiver feeding WCIN. Its input current limit
++      property sets the WCIN limit while the phone charges from a pad.
++
++  maxim,wireless-input-current-microamp:
++    default: 500000
++    description:
++      WCIN input current limit when the receiver does not give one.
++
++  maxim,wireless-charge-current-microamp:
++    description: Charge current while charging from WCIN.
++
+   reg:
+     maxItems: 1
+ 
+diff --git a/drivers/power/supply/max77705_charger.c b/drivers/power/supply/max77705_charger.c
+index 9079a0c..54e147e 100644
+--- a/drivers/power/supply/max77705_charger.c
++++ b/drivers/power/supply/max77705_charger.c
+@@ -73,6 +73,12 @@ static irqreturn_t max77705_aicl_irq(int irq, void *irq_drv_data)
+ 	unsigned int regval, irq_status;
+ 	int err;
+ 
++	/* on a pad it is the WCIN limit that has to come down */
++	if (READ_ONCE(chg->wcin_active)) {
++		queue_work(chg->wqueue, &chg->wcin_aicl_work);
++		return IRQ_HANDLED;
++	}
++
+ 	err = regmap_read(chg->regmap, MAX77705_CHG_REG_INT_OK, &irq_status);
+ 	if (err < 0)
+ 		return IRQ_HANDLED;
+@@ -84,6 +90,9 @@ static irqreturn_t max77705_aicl_irq(int irq, void *irq_drv_data)
+ 		if (err < 0)
+ 			return IRQ_HANDLED;
+ 
++		/* never below 100 mA: the field would wrap to its maximum */
++		if (regval <= MAX77705_CURRENT_CHGIN_MIN / MAX77705_CURRENT_CHGIN_STEP - 1)
++			break;
+ 		regval--;
+ 
+ 		err = regmap_field_write(chg->rfield[MAX77705_CHG_CHGIN_LIM], regval);
+@@ -105,6 +114,17 @@ static irqreturn_t max77705_chgin_irq(int irq, void *irq_drv_data)
+ 	struct max77705_charger_data *chg = irq_drv_data;
+ 
+ 	queue_work(chg->wqueue, &chg->chgin_work);
++	/* a cable arriving or leaving decides which input is in use */
++	queue_work(chg->wqueue, &chg->wcin_work);
++
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t max77705_wcin_irq(int irq, void *irq_drv_data)
++{
++	struct max77705_charger_data *chg = irq_drv_data;
++
++	queue_work(chg->wqueue, &chg->wcin_work);
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -183,7 +203,7 @@ static int max77705_get_online(struct regmap *regmap, int *val)
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	*val = !!(data & MAX77705_CHGIN_OK);
++	*val = !!(data & (MAX77705_CHGIN_OK | MAX77705_WCIN_OK));
+ 
+ 	return 0;
+ }
+@@ -203,6 +223,19 @@ static int max77705_set_input_current(struct max77705_charger_data *chg, int mic
+ 	return regmap_field_write(chg->rfield[MAX77705_CHG_CHGIN_LIM], regval);
+ }
+ 
++/* WCIN_LIM (CNFG_10): 25 mA steps, limit minus one step like CHGIN_LIM */
++static int max77705_set_wcin_current(struct max77705_charger_data *chg,
++				     unsigned int microamp)
++{
++	unsigned int regval;
++
++	regval = clamp_val(microamp, MAX77705_CURRENT_CHGIN_MIN,
++			   MAX77705_CURRENT_WCIN_MAX);
++	regval = regval / MAX77705_CURRENT_CHGIN_STEP - 1;
++
++	return regmap_field_write(chg->rfield[MAX77705_CHG_WCIN], regval);
++}
++
+ static int max77705_set_charge_current(struct max77705_charger_data *chg, int microamp)
+ {
+ 	unsigned int regval;
+@@ -311,14 +344,23 @@ static int max77705_get_status(struct max77705_charger_data *chg, int *val)
+ static int max77705_get_vbus_state(struct regmap *regmap, int *value)
+ {
+ 	int ret;
+-	unsigned int charge_dtls;
++	unsigned int charge_dtls, ok;
++
++	ret = regmap_read(regmap, MAX77705_CHG_REG_INT_OK, &ok);
++	if (ret)
++		return ret;
+ 
+ 	ret = regmap_read(regmap, MAX77705_CHG_REG_DETAILS_00, &charge_dtls);
+ 	if (ret)
+ 		return ret;
+ 
+-	charge_dtls = ((charge_dtls & MAX77705_CHGIN_DTLS) >>
+-			MAX77705_CHGIN_DTLS_SHIFT);
++	/* the input that is in use: CHGIN, or WCIN on a pad */
++	if (!(ok & MAX77705_CHGIN_OK) && (ok & MAX77705_WCIN_OK))
++		charge_dtls = (charge_dtls & MAX77705_WCIN_DTLS) >>
++			      MAX77705_WCIN_DTLS_SHIFT;
++	else
++		charge_dtls = ((charge_dtls & MAX77705_CHGIN_DTLS) >>
++				MAX77705_CHGIN_DTLS_SHIFT);
+ 
+ 	switch (charge_dtls) {
+ 	case 0x00:
+@@ -401,7 +443,10 @@ static int max77705_get_input_current(struct max77705_charger_data *chg,
+ 	unsigned int reg_data;
+ 	int get_current = 0;
+ 
+-	regmap_field_read(chg->rfield[MAX77705_CHG_CHGIN_LIM], &reg_data);
++	/* the limit of the input in use: WCIN_LIM on a pad, same encoding */
++	regmap_field_read(chg->rfield[READ_ONCE(chg->wcin_active) ?
++				      MAX77705_CHG_WCIN : MAX77705_CHG_CHGIN_LIM],
++			  &reg_data);
+ 
+ 	if (reg_data <= 3)
+ 		get_current = MAX77705_CURRENT_CHGIN_MIN;
+@@ -634,6 +679,173 @@ static int max77705_set_b2sovrc(struct max77705_charger_data *chg)
+ 	return 0;
+ }
+ 
++/*
++ * Wireless input, as stock's charger does it (max77705_change_charge_path,
++ * wc_current_work): CNFG_12 selects WCIN alone (0x40) while the phone charges
++ * wirelessly and both inputs (0x60) otherwise, so a cable takes over from the
++ * pad. The WCIN limit starts at 480 mA and goes up 100 mA a second to what
++ * the receiver asks for (stock's per-pad current table); without a receiver
++ * driver it stays at the DT default. Back to 425 mA when the pad goes away.
++ */
++#define MAX77705_WCIN_RAMP_START_UA	480000
++#define MAX77705_WCIN_RAMP_STEP_UA	100000
++#define MAX77705_WCIN_RAMP_MS		1000
++#define MAX77705_WCIN_IDLE_UA		425000
++
++/*
++ * The receiver is looked up for each read and put right after: holding it
++ * would keep its power supply alive past its driver (an unbind or a module
++ * unload), with its property callbacks gone. It also means the charger never
++ * waits for the receiver at probe.
++ */
++static unsigned int max77705_wcin_target(struct max77705_charger_data *chg)
++{
++	unsigned int target = chg->wcin_default_ua;
++	union power_supply_propval val;
++	struct power_supply *wls;
++
++	wls = power_supply_get_by_reference(dev_fwnode(chg->dev),
++					    "maxim,wireless-charger");
++	if (IS_ERR_OR_NULL(wls))
++		return target;
++
++	if (!power_supply_get_property(wls, POWER_SUPPLY_PROP_ONLINE, &val) &&
++	    val.intval &&
++	    !power_supply_get_property(wls, POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
++				       &val) &&
++	    val.intval > 0)
++		target = min_t(unsigned int, val.intval, MAX77705_CURRENT_WCIN_MAX);
++
++	power_supply_put(wls);
++
++	return target;
++}
++
++static void max77705_wcin_work(struct work_struct *work)
++{
++	struct max77705_charger_data *chg =
++		container_of(work, struct max77705_charger_data, wcin_work);
++	unsigned int ok;
++	bool active;
++
++	if (regmap_read(chg->regmap, MAX77705_CHG_REG_INT_OK, &ok))
++		return;
++
++	/*
++	 * A cable wins over the pad, as in stock. While the boost feeds CHGIN
++	 * for OTG, WCIN is left alone: stock switches WCINSEL around that mode
++	 * change ("shutdown problem"), which is not done here.
++	 */
++	active = (ok & MAX77705_WCIN_OK) && !(ok & MAX77705_CHGIN_OK) &&
++		 !chg->otg_on;
++
++	if (!active) {
++		cancel_delayed_work(&chg->wcin_ramp_work);
++		if (!chg->wcin_active)
++			return;
++		regmap_update_bits(chg->regmap, MAX77705_CHG_REG_CNFG_12,
++				   MAX77705_CHGINSEL_MASK, MAX77705_CHGINSEL_MASK);
++		max77705_set_wcin_current(chg, MAX77705_WCIN_IDLE_UA);
++		chg->wcin_limit = MAX77705_WCIN_IDLE_UA;
++		WRITE_ONCE(chg->wcin_active, false);
++		dev_info(chg->dev, "wireless input off\n");
++		power_supply_changed(chg->psy_chg);
++		return;
++	}
++
++	chg->wcin_target = max77705_wcin_target(chg);
++
++	if (!chg->wcin_active) {
++		regmap_update_bits(chg->regmap, MAX77705_CHG_REG_CNFG_12,
++				   MAX77705_CHGINSEL_MASK, 0);
++		if (chg->wcin_charge_ua)
++			max77705_set_charge_current(chg, chg->wcin_charge_ua);
++		chg->wcin_limit = min(chg->wcin_target,
++				      MAX77705_WCIN_RAMP_START_UA);
++		max77705_set_wcin_current(chg, chg->wcin_limit);
++		WRITE_ONCE(chg->wcin_active, true);
++		dev_info(chg->dev, "wireless input on, %u mA\n",
++			 chg->wcin_target / 1000);
++		power_supply_changed(chg->psy_chg);
++	} else if (chg->wcin_target < chg->wcin_limit) {
++		/* lower at once, raise in steps */
++		chg->wcin_limit = chg->wcin_target;
++		max77705_set_wcin_current(chg, chg->wcin_limit);
++	}
++
++	if (chg->wcin_limit < chg->wcin_target)
++		mod_delayed_work(chg->wqueue, &chg->wcin_ramp_work,
++				 msecs_to_jiffies(MAX77705_WCIN_RAMP_MS));
++}
++
++static void max77705_wcin_ramp_work(struct work_struct *work)
++{
++	struct max77705_charger_data *chg =
++		container_of(work, struct max77705_charger_data,
++			     wcin_ramp_work.work);
++
++	if (!chg->wcin_active || chg->wcin_limit >= chg->wcin_target)
++		return;
++
++	chg->wcin_limit = min(chg->wcin_limit + MAX77705_WCIN_RAMP_STEP_UA,
++			      chg->wcin_target);
++	max77705_set_wcin_current(chg, chg->wcin_limit);
++
++	if (chg->wcin_limit < chg->wcin_target)
++		queue_delayed_work(chg->wqueue, &chg->wcin_ramp_work,
++				   msecs_to_jiffies(MAX77705_WCIN_RAMP_MS));
++}
++
++/*
++ * AICL on WCIN (a weak or misaligned pad): step the WCIN limit down until the
++ * input holds, never below 100 mA, and keep the ramp from going up again
++ * until the receiver changes.
++ */
++static void max77705_wcin_aicl_work(struct work_struct *work)
++{
++	struct max77705_charger_data *chg =
++		container_of(work, struct max77705_charger_data, wcin_aicl_work);
++	unsigned int ok;
++
++	if (!chg->wcin_active)
++		return;
++
++	while (!regmap_read(chg->regmap, MAX77705_CHG_REG_INT_OK, &ok) &&
++	       !(ok & MAX77705_AICL_OK) &&
++	       chg->wcin_limit > MAX77705_CURRENT_CHGIN_MIN) {
++		chg->wcin_limit -= MAX77705_CURRENT_CHGIN_STEP;
++		max77705_set_wcin_current(chg, chg->wcin_limit);
++		msleep(AICL_WORK_DELAY_MS);
++	}
++
++	cancel_delayed_work(&chg->wcin_ramp_work);
++	chg->wcin_target = chg->wcin_limit;
++	dev_info(chg->dev, "AICL: wireless input at %u mA\n",
++		 chg->wcin_limit / 1000);
++}
++
++/* the power supply notifier chain is atomic: only queue the work here */
++static int max77705_psy_notifier(struct notifier_block *nb,
++				 unsigned long event, void *data)
++{
++	struct max77705_charger_data *chg =
++		container_of(nb, struct max77705_charger_data, psy_nb);
++	struct power_supply *psy = data;
++
++	if (event == PSY_EVENT_PROP_CHANGED &&
++	    psy->desc->type == POWER_SUPPLY_TYPE_WIRELESS)
++		queue_work(chg->wqueue, &chg->wcin_work);
++
++	return NOTIFY_OK;
++}
++
++static void max77705_charger_unreg_notifier(void *data)
++{
++	struct max77705_charger_data *chg = data;
++
++	power_supply_unreg_notifier(&chg->psy_nb);
++}
++
+ static int max77705_charger_parse_dt(struct max77705_charger_data *chg)
+ {
+ 	struct device *dev = chg->dev;
+@@ -701,6 +913,13 @@ static int max77705_charger_parse_dt(struct max77705_charger_data *chg)
+ 				 &chg->pd_max_input_ua);
+ 	device_property_read_u32(dev, "maxim,pd-max-charge-current-microamp",
+ 				 &chg->pd_max_charge_ua);
++	/* wireless input: stock's WCIN_ILIM at init, cable-info WIRELESS FCC */
++	if (device_property_read_u32(dev, "maxim,wireless-input-current-microamp",
++				     &chg->wcin_default_ua))
++		chg->wcin_default_ua = 500000;
++	device_property_read_u32(dev, "maxim,wireless-charge-current-microamp",
++				 &chg->wcin_charge_ua);
++
+ 	ret = device_property_count_u8(dev, "maxim,pd-sink-caps");
+ 	if (ret > 0 && ret <= MAX77705_USBC_OPCODE_DATA_LEN &&
+ 	    !device_property_read_u8_array(dev, "maxim,pd-sink-caps",
+@@ -1086,6 +1305,8 @@ static int max77705_charger_set_otg(struct max77705_charger_data *chg, bool enab
+ 		chg->otg_on = false;
+ 	}
+ 
++	/* WCIN is left alone while OTG is on, picked up again after */
++	queue_work(chg->wqueue, &chg->wcin_work);
+ 	power_supply_changed(chg->psy_chg);
+ 	return 0;
+ }
+@@ -1560,12 +1781,22 @@ static int max77705_charger_initialize(struct max77705_charger_data *chg)
+ 	if (err)
+ 		goto err;
+ 
+-	/* charge from CHGIN, this board has no wireless charger */
++	/*
++	 * Both inputs selected (stock 0x60); max77705_wcin_work() deselects
++	 * CHGIN while the phone charges from a pad. WCIN_LIM starts at stock's
++	 * 500 mA.
++	 */
+ 	err = regmap_update_bits(regmap, MAX77705_CHG_REG_CNFG_12,
+-				 MAX77705_CHGINSEL_MASK, MAX77705_CHGINSEL_MASK);
++				 MAX77705_CHGINSEL_MASK | MAX77705_WCINSEL_MASK,
++				 MAX77705_CHGINSEL_MASK | MAX77705_WCINSEL_MASK);
+ 	if (err)
+ 		goto err;
+ 
++	err = max77705_set_wcin_current(chg, 500000);
++	if (err)
++		goto err;
++	chg->wcin_limit = 500000;
++
+ 	err = regmap_field_write(chg->rfield[MAX77705_WCIN], MAX77705_WCIN_4_5);
+ 	if (err)
+ 		goto err;
+@@ -1736,6 +1967,17 @@ static int max77705_charger_probe(struct i2c_client *i2c)
+ 	ret = devm_delayed_work_autocancel(dev, &chg->afc_work, max77705_afc_work);
+ 	if (ret)
+ 		return ret;
++	ret = devm_work_autocancel(dev, &chg->wcin_work, max77705_wcin_work);
++	if (ret)
++		return ret;
++	ret = devm_delayed_work_autocancel(dev, &chg->wcin_ramp_work,
++					   max77705_wcin_ramp_work);
++	if (ret)
++		return ret;
++	ret = devm_work_autocancel(dev, &chg->wcin_aicl_work,
++				   max77705_wcin_aicl_work);
++	if (ret)
++		return ret;
+ 
+ 	ret = max77705_charger_initialize(chg);
+ 	if (ret)
+@@ -1752,6 +1994,21 @@ static int max77705_charger_probe(struct i2c_client *i2c)
+ 	if (ret)
+ 		return ret;
+ 
++	chg->psy_nb.notifier_call = max77705_psy_notifier;
++	ret = power_supply_reg_notifier(&chg->psy_nb);
++	if (ret)
++		return ret;
++	ret = devm_add_action_or_reset(dev, max77705_charger_unreg_notifier, chg);
++	if (ret)
++		return ret;
++
++	ret = devm_request_threaded_irq(dev, regmap_irq_get_virq(irq_data, MAX77705_WCIN_I),
++					NULL, max77705_wcin_irq,
++					IRQF_TRIGGER_NONE,
++					"wcin-irq", chg);
++	if (ret)
++		return ret;
++
+ 	ret = devm_request_threaded_irq(dev, regmap_irq_get_virq(irq_data, MAX77705_AICL_I),
+ 					NULL, max77705_aicl_irq,
+ 					IRQF_TRIGGER_NONE,
+@@ -1763,6 +2020,9 @@ static int max77705_charger_probe(struct i2c_client *i2c)
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "failed to enable charge\n");
+ 
++	/* the phone may have booted on a pad */
++	queue_work(chg->wqueue, &chg->wcin_work);
++
+ 	return devm_add_action_or_reset(dev, max77705_charger_disable, chg);
+ }
+ 
+diff --git a/include/linux/power/max77705_charger.h b/include/linux/power/max77705_charger.h
+index 7014694..8d313e8 100644
+--- a/include/linux/power/max77705_charger.h
++++ b/include/linux/power/max77705_charger.h
+@@ -136,6 +136,8 @@
+ #define MAX77705_VCHGIN_4_6		1
+ #define MAX77705_CHGINSEL_SHIFT		5
+ #define MAX77705_CHGINSEL_MASK		BIT(MAX77705_CHGINSEL_SHIFT)
++#define MAX77705_WCINSEL_SHIFT		6
++#define MAX77705_WCINSEL_MASK		BIT(MAX77705_WCINSEL_SHIFT)
+ /* REG=4.5V, UVLO=4.7V */
+ #define MAX77705_WCIN_4_5		0
+ #define MAX77705_DISABLE_SKIP		1
+@@ -197,6 +199,7 @@
+ #define MAX77705_CURRENT_CHGIN_MIN	100000
+ #define MAX77705_CURRENT_CHGIN_MAX	3200000
+ #define MAX77705_CURRENT_CHG_MAX	3150000
++#define MAX77705_CURRENT_WCIN_MAX	1600000
+ 
+ /* One entry per BC1.2 port type, in register order: SDP, CDP, DCP */
+ #define MAX77705_NUM_PORT_TYPES		3
+@@ -305,6 +308,17 @@ struct max77705_charger_data {
+ 	unsigned int		pd_max_voltage_mv;
+ 	unsigned int		pd_max_input_ua;
+ 	unsigned int		pd_max_charge_ua;
++
++	/* wireless input (WCIN), fed by the wireless charger receiver */
++	struct work_struct	wcin_work;
++	struct delayed_work	wcin_ramp_work;
++	struct work_struct	wcin_aicl_work;
++	struct notifier_block	psy_nb;
++	bool			wcin_active;
++	unsigned int		wcin_limit;	/* uA, what CNFG_10 holds now */
++	unsigned int		wcin_target;	/* uA */
++	unsigned int		wcin_default_ua;
++	unsigned int		wcin_charge_ua;
+ };
+ 
+ #endif /* __MAX77705_CHARGER_H */

@@ -1,0 +1,172 @@
+# Deltas on top of configs/nura-sm8350.config. Every line here was on the kernel that first
+# reached userspace on the F711N (evidence/SM-F711N-m0.md, 2026-11-06).
+
+# The kernel is booted by U-Boot, which passes the command line from the Linux image
+# header (configs/cmdline). ABL, which used to replace it with Samsung's vendor line,
+# only ever sees U-Boot now.
+CONFIG_CMDLINE=""
+# CONFIG_CMDLINE_FORCE is not set
+
+# simpledrm draws fbcon through a shadow buffer, so the last lines before a reset never reach
+# the panel. simplefb writes straight into the scanout buffer.
+# CONFIG_DRM_SIMPLEDRM is not set
+CONFIG_FB_SIMPLE=y
+CONFIG_FONTS=y
+CONFIG_FONT_8x16=y
+CONFIG_FONT_TER16x32=y
+
+# The initramfs has no module loader; the ACM gadget comes from configfs.
+CONFIG_USB_LIBCOMPOSITE=y
+CONFIG_USB_CONFIGFS=y
+
+# Not needed to boot, and they need extra toolchains.
+# CONFIG_RUST is not set
+# CONFIG_DEBUG_INFO_BTF is not set
+# CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT is not set
+# CONFIG_DEBUG_INFO_DWARF5 is not set
+CONFIG_DEBUG_INFO_NONE=y
+
+# / is F2FS on an LVM volume spanning super and userdata, mounted by the initramfs,
+# so both have to be built in. evdev gives the initramfs /dev/input for the keys.
+CONFIG_BLK_DEV_DM=y
+CONFIG_F2FS_FS=y
+CONFIG_F2FS_FS_COMPRESSION=y
+CONFIG_F2FS_FS_LZ4=y
+CONFIG_F2FS_FS_ZSTD=y
+# security.* xattrs on /: file capabilities (setcap in package installs: kwin_wayland's
+# cap_sys_nice, gst-ptp-helper, the ksystemstats helpers)
+CONFIG_F2FS_FS_SECURITY=y
+CONFIG_INPUT_EVDEV=y
+
+# Bluetooth profiles the Nura config leaves out: LE (most peripherals), RFCOMM
+# (serial and hands-free audio) and BNEP (bluetoothd warns without it).
+CONFIG_BT_LE=y
+CONFIG_BT_RFCOMM=m
+CONFIG_BT_RFCOMM_TTY=y
+CONFIG_BT_BNEP=m
+CONFIG_BT_BNEP_MC_FILTER=y
+CONFIG_BT_BNEP_PROTO_FILTER=y
+
+# The MAX77705 core routes the USB-C D+/D- lines to the SoC (patches/linux/0002, 0003);
+# built in so the initramfs rescue gadget gets USB without a cable re-plug.
+CONFIG_MFD_MAX77705=y
+
+# Main display touch: STM FTS9CU80F with Samsung firmware (patches/linux/0005).
+CONFIG_TOUCHSCREEN_FTS9CU80F=m
+
+# Main display panel: S6E3HAD AMF670ZA01 (patches/linux/0006). Built in, with the
+# bit-banged I2C bus and the S2DOS05 PMIC (Samsung sec MFD core) that supply it, so DRM takes over within
+# a second of MDSS resetting the bootloader's pipeline instead of waiting for
+# modules from the rootfs.
+CONFIG_DRM_PANEL_SAMSUNG_S6E3HAD=y
+# Cover display: S6E36W3 AMB190ZB01 on DSI1 (patches/linux/0036).
+CONFIG_DRM_PANEL_SAMSUNG_S6E36W3=y
+# Cover touchscreen: Zinitix ZTW522 on QUP i2c17 (patches/linux/0038).
+CONFIG_TOUCHSCREEN_ZINITIX=y
+CONFIG_I2C_ALGOBIT=y
+CONFIG_I2C_GPIO=y
+CONFIG_MFD_SEC_CORE=y
+CONFIG_MFD_SEC_I2C=y
+CONFIG_REGULATOR_S2DOS05=y
+# S2MPB02 companion PMIC on its own bit-banged bus (patches/linux/0026-0031):
+# its regulators (the cover panel's VCI) and the rear flash/torch LED.
+CONFIG_REGULATOR_S2MPB02=y
+CONFIG_LEDS_S2MPB02=y
+# Grip sensor: Semtech SX9360 on a bit-banged bus (patches/linux/0032).
+CONFIG_SX9360=y
+# PMK8350 RTC, its offset kept in SDAM14 (built in for hctosys)
+CONFIG_RTC_DRV_PM8XXX=y
+CONFIG_NVMEM_SPMI_SDAM=y
+# Haptic motor: GCC GP2 as PWM for the MAX77705 haptic driver
+CONFIG_PWM_QCOM_GP=y
+CONFIG_INPUT_MAX77693_HAPTIC=m
+# MAX77705 fuel gauge
+CONFIG_BATTERY_MAX17042=m
+# MAX77705 charger and the S2ASL01 dual-cell current limiters
+CONFIG_CHARGER_MAX77705=m
+CONFIG_CHARGER_S2ASL01=m
+# IDT P9320 wireless charging receiver (stock mfc-charger@3b on board revisions 05 and up)
+CONFIG_CHARGER_P9320=m
+# Samsung dual cell charging over the two limiters
+CONFIG_BATTERY_SAMSUNG_DUAL=m
+# Cellular data: the rmnet MAP driver provides the netlink link API ModemManager
+# uses to add a muxed bearer on top of the IPA netdev (rmnet_ipa0); without it
+# mmcli --simple-connect fails with EOPNOTSUPP. RMNET sits behind the vendor
+# ethernet menu, so the two gates must be on too (the minimal base config has
+# CONFIG_ETHERNET off, which hides them and silently drops the RMNET line).
+CONFIG_ETHERNET=y
+CONFIG_NET_VENDOR_QUALCOMM=y
+CONFIG_RMNET=m
+# IMS on SKT and KT: imsroha's sec-agree puts the SIP signalling in IPsec ESP
+# transport SAs, installed over XFRM netlink (ip xfrm). The base config has
+# neither; without them SA setup fails and imsroha registers without IPsec,
+# which those networks may refuse. Both modules load on demand.
+CONFIG_XFRM_USER=m
+CONFIG_INET6_ESP=m
+CONFIG_INET_ESP=m
+# Audio: the sm8350 LPASS LPI pin controller lives in the sc7280 driver. Without
+# it lpass_tlmm has no driver and the DMIC pins never leave GPIO mode.
+CONFIG_PINCTRL_SC7280_LPASS_LPI=y
+# Fingerprint bring-up: the legacy QSEECOM SCM interface plus the probe module
+# from patches/linux/0040-*, which loads Samsung's securefp TA by hand. At boot
+# QSEECOM only queries the QSEE version; the probe does nothing until loaded.
+CONFIG_QCOM_QSEECOM=y
+CONFIG_QCOM_QSEECOM_PROBE=m
+# Fingerprint: the sensor rail (S2MPB02 L16) as a regulator-output node, switched by the
+# userspace HAL from sysfs, like stock's GF_IOC_POWER_CONTROL (patches/linux/0048-*).
+CONFIG_REGULATOR_USERSPACE_CONSUMER=y
+# Fingerprint: /dev/qsee-app, the userspace interface to the securefp TA (patches/linux/0049-*).
+CONFIG_QCOM_QSEE_APP=m
+CONFIG_QCOM_SPSS_LISTENER=m
+CONFIG_RPMSG_QCOM_GLINK_SPSS=m
+CONFIG_RPMSG_CTRL=m
+CONFIG_RPMSG_CHAR=m
+# Cameras: the SM8350 camera clock controller (patches/linux/0056-*).
+CONFIG_SM_CAMCC_8350=m
+# Cameras: the rear ultrawide (IMX258, patches/linux/0059-0061; or an S5K3L6, 0137).
+CONFIG_VIDEO_IMX258=m
+CONFIG_VIDEO_S5K3L6=m
+# Cameras: the front IMX374 (patches/linux/0062-0063).
+CONFIG_VIDEO_IMX374=m
+# Cameras: the rear wide IMX563 (patches/linux/0076-0077).
+CONFIG_VIDEO_IMX563=m
+# Cameras: the rear wide's AK7377 focus actuator (patches/linux/0099-0100).
+CONFIG_VIDEO_AK7375=m
+# Cameras: the rear wide's OIS MCU and its calibration EEPROM (patches/linux/0116-0118).
+CONFIG_VIDEO_SAMSUNG_OIS_MCU=m
+CONFIG_EEPROM_AT24=m
+
+# GPU as a thermal cooling device (msm registers devfreq cooling; the sm8350
+# gpu-top/bottom zones and the b2q skin and PMIC zones map onto it)
+CONFIG_DEVFREQ_THERMAL=y
+
+# The modem's thermistors over QMI (patch 0108): inputs of the skin estimate
+CONFIG_QCOM_QMI_TS=m
+
+# No ramoops: its records never survived a reset on this phone, and it garbled the
+# kernel console at startup (2026-11-11). The DT node is disabled too (0123).
+# CONFIG_PSTORE_RAM is not set
+
+# Tailscale marks its packets for the rp_filter workaround (2026-11-11).
+CONFIG_NETFILTER_XT_CONNMARK=m
+CONFIG_NETFILTER_XT_TARGET_CONNMARK=m
+CONFIG_NETFILTER_XT_MATCH_CONNMARK=m
+
+# PCIe link-down recovery reaches the endpoint drivers (pcie_do_recovery()), so ath11k can
+# restore the Wi-Fi chip after pcie-qcom resets the Root Port
+CONFIG_PCIEAER=y
+
+# OpenWrt router needs (fw4 / nft tproxy-redir, overlay rootfs)
+CONFIG_NFT_REDIR=y
+CONFIG_NETFILTER_XT_TARGET_TPROXY=m
+CONFIG_NETFILTER_XT_MATCH_SOCKET=m
+CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=m
+CONFIG_IP_NF_TARGET_MASQUERADE=m
+CONFIG_OVERLAY_FS=y
+CONFIG_USB_CONFIGFS_NCM=y
+CONFIG_USB_CONFIGFS_EEM=y
+CONFIG_NET_IPIP=m
+CONFIG_INET_DIAG=y
+CONFIG_PACKET=y
+
+# CONFIG_LOCALVERSION_AUTO is not set
