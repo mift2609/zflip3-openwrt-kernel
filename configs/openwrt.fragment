@@ -170,3 +170,13 @@ CONFIG_INET_DIAG=y
 CONFIG_PACKET=y
 
 # CONFIG_LOCALVERSION_AUTO is not set
+
+# Bring-up debug for the Wi-Fi chip (2026-11-20): ath11k on this unit reaches
+# "mhi mhi0: Wait for device to enter SBL or Mission mode" and stops, with no
+# wlan0. ath11k_dbg() is compiled out unless CONFIG_ATH11K_DEBUG is set, so the
+# module param ath11k.debug_mask alone shows nothing.
+CONFIG_MAC80211_DEBUG_MENU=y
+CONFIG_MAC80211_DEBUGFS=y
+CONFIG_ATH11K_DEBUG=y
+CONFIG_ATH11K_DEBUGFS=y
+CONFIG_MHI_BUS_DEBUG=y
