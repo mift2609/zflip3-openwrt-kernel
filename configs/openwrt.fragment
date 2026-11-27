@@ -180,3 +180,10 @@ CONFIG_MAC80211_DEBUGFS=y
 CONFIG_ATH11K_DEBUG=y
 CONFIG_ATH11K_DEBUGFS=y
 CONFIG_MHI_BUS_DEBUG=y
+
+# zflip3 2026-11-27: QRTR/QMI built-in supaya transport modem & /dev/qrtr0
+# tersedia tanpa load module (eUICC/eSIM dikendalikan via QMI ke modem).
+CONFIG_MHI_BUS=y
+CONFIG_QRTR_TUN=y
+CONFIG_QRTR_MHI=y
+CONFIG_QCOM_QMI_TS=y
